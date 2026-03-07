@@ -531,14 +531,17 @@ C++根据使用场景 提供了6中内存顺序
 不保证内存访问顺序
 不提供线程同步
 性能最好，适合计数器
+std::atomic<FreeNode*>head=nullptr;
+void push(){
+head.load(std::memory_order_relaxed);//memory_order_relaxed是为了读取值时候head不会被其他线程中断。
+}
 
-2、memory_order_consume //废弃 deprecete 用memory_order_acquire
+2、memory_order_consume //废弃 deprecate 用memory_order_acquire
     
-3、memory_order_acquire
+3、std::load(memory_order_acquire)
 用于加载操作
 确保该操作之后的所有读写不会被重排到该操作之前。
-    
-4、memory_order_release
+4、std::store(value,std::memory_order_release)
 用于存储操作
 确保该操作之前的所有读写不会被重排到该操作之后
 与memory_order_acquire配对
@@ -575,12 +578,12 @@ acquire & release 等原子操作比mutex轻。
 // ↓ 之前的所有操作不能越过这个点向后移动 ↓
 x = 1;                      // 操作A
 y = 2;                      // 操作B  
-atomic.store(val, std::memory_order_release);  // 释放点
-z = 3;                      // 操作C（可能被重排到前面！）
+atom.store(val, std::memory_order_release);  // 释放点
+z = 3;                      
 
 // acquire 屏障方向：阻止之后操作移到之前
 // ↓ 之后的所有操作不能越过这个点向前移动 ↓
-int val = atomic.load(std::memory_order_acquire);  // 获取点
+int val = atom.load(std::memory_order_acquire);  // 获取点
 a = data1;                   // 操作D（不会移到load前面）
 b = data2;                   // 操作E（不会移到load前面）
 
@@ -1022,6 +1025,7 @@ perf script > out.perf     #生成了这一步可以使用https://ui.perfetto.de
 
 # valgrind 检测内存泄露
 
+asan & kasan 扫描内存泄露
 能检测到运行时候的内存情况。虽然最后都有系统回收，那样不是不存在泄露了？------ 我们讨论的是运行时候的内存泄露情况。
 
 ```shell
@@ -1030,6 +1034,150 @@ gcc -g -o test test.c
 # 使用 Valgrind 的内存检查工具运行程序
 valgrind --tool=memcheck --leak-check=full ./test
 ```
+
+
+
+# performance分析
+
+## p50 & p99
+
+p是percentage。
+eg：p99=500 表示99%的样本不超过500
+
+不超过P99的样本占99%
+
+## 设置CPU亲和性
+
+### 什么是调度漂移
+
+线程不是一启动就永远固定在某个核心上跑。操作系统会根据负载不断调度它：
+
+- 这个线程先在 CPU 1 跑一会儿
+- 然后被抢占
+- 过一会儿恢复时，可能跑到 CPU 4
+- 再过一会儿又被迁移到 CPU 7
+
+这种“运行核心和运行时机不断变化”的现象，就可以理解成调度漂移。
+
+它主要包含两类事：
+
+#### 1) 时间上的漂移
+
+线程本来连续执行，结果被中途打断：
+
+- 时间片用完
+- 被更高优先级线程抢占
+- 主机上还有别的任务在跑
+
+于是一次操作本来只要几百纳秒，结果中间被 OS 插了一脚，测出来可能变成几十微秒甚至更高。
+
+#### 2) 空间上的漂移
+
+线程本来在一个核上跑，后来被迁移到另一个核上。
+ 这会影响：
+
+- cache 命中率
+- TLB
+- NUMA 局部性
+- cache line 所有权转移
+
+所以即使代码没变，测出来的性能也会抖。
+
+绑定CPU核心 避免 调度漂移
+
+
+
+
+
+
+
+# protobuf与android AIDL 序列化的联系：
+
+| **特性**       | **Android 原生 (Parcelable + AIDL)**                       | **Google 生态 (Protobuf + gRPC/Utility)**                    |
+| -------------- | ---------------------------------------------------------- | ------------------------------------------------------------ |
+| **设计初衷**   | 专为 Android **手机本地**跨进程通信优化。                  | 专为**全球网络**、异构系统的高性能通信设计。                 |
+| **核心协议**   | **AIDL (Android Interface Definition Language)**           | **`.proto` (Protocol Buffer 定义文件)**                      |
+| **序列化接口** | 实现 `Parcelable` 接口。                                   | 使用生成的 Proto Message 类。                                |
+| **二进制格式** | **TLV-like**, 但侧重于**顺序解析**，依赖两端代码严格一致。 | **严格的严格的 TLV (Tag-Length-Value)**，极其紧凑，且具有自我描述性。 |
+| **主要优势**   | **零反射，极速**，直接与 Android 驱动集成。                | **跨语言、跨平台**；**极强的向后/向前兼容性**。              |
+| **主要劣势**   | 跨平台维护困难；版本兼容性脆弱（新加字段很难处理）。       | 需要引入 Protobuf 运行时 SDK；APK 体积会略微增加。           |
+
+
+
+# yeild & sleep & spin
+
+## 三者的对比
+
+| 行为         | 自旋（spin）                 | yield                            | sleep                              |
+| :----------- | :--------------------------- | :------------------------------- | :--------------------------------- |
+| **CPU 占用** | 一直占用 CPU，空转           | 暂时让出 CPU，但很快可能又运行   | 不占用 CPU，完全让出               |
+| **线程状态** | 运行态（running）            | 运行态 → 就绪态（ready）         | 运行态 → 睡眠态（sleeping）        |
+| **响应速度** | 最快（一旦锁释放，立即获取） | 较快（取决于调度器何时重新调度） | 慢（必须等待休眠结束或被唤醒）     |
+| **适用场景** | 锁持有极短，多核，竞争不激烈 | 锁持有较短但可能偶尔长，负载高   | 锁持有较长，或希望线程休眠一段时间 |
+| **缺点**     | 浪费 CPU 资源                | 可能频繁调度，效果不稳定         | 延迟大，不适合短等待               |
+
+
+
+# 零拷贝是传左值引用&右值引用&还是const 左值引用？
+
+## 构造核心原则：看实参是左值还是右值
+
+### 如果有参数需要构造，改调用什么构造：
+
+实参是左值  →  调用拷贝构造
+实参是右值  →  调用移动构造
+
+### 那么什么时候需要构造对象呢？
+
+看声明的是值类型还是引用类型
+
+```c++
+vector<int> v  = ...;   // 值类型  → 需要构造新对象
+vector<int>& v  = ...;  // 左值引用 → 不构造，绑定
+vector<int>&& v = ...;  // 右值引用 → 不构造，绑定
+```
+
+std::move 返回的是一个右值引用类型。移动构造，才是正真的移动操作。
+
+```c++
+//std::move() 返回 的是右值引用 &&  
+template<typename _Tp>
+    [[__nodiscard__,__gnu__::__always_inline__]]
+    constexpr typename std::remove_reference<_Tp>::type&&
+    move(_Tp&& __t) noexcept
+    { return static_cast<typename std::remove_reference<_Tp>::type&&>(__t); }
+
+```
+
+下面举个例子来分析一下传哪些值
+
+```c++
+void processA(std::vector<int> v){
+    ...
+}
+
+void processB(const std::vector<int> &v){
+    ...//传const &，不能更改。
+}
+
+void processC(std::vector<int> &v){
+    ....//传左值语义不明确，容易被更改了，不知道哪里改的。
+}
+
+void processD(std::vector<int> &&v){//这里是右值引用的赋值，没有调用 移动构造函数。
+    ...//
+}
+
+int main(){
+    vector<int> v1;
+	processA(std::move(v1));//这里是否要构造对象？需要，被赋值的是值类型。 怎么构造对象？实参是右值类型，调用移动构造函数。
+	processB(v1);//这里是否要构造对象？不需要，被赋值的是const 引用类型。
+    processC(v1);//这里是否要构造对象？不需要，被赋值的是左值引用类型。
+    processD(std::move(v1));//这里是否需要构造对象？不需要，被赋值的是右值引用类型。
+}
+```
+
+所以结论是 传右值引用（实参）给，常量（形参），减少拷贝，直接移动。
 
 
 
